@@ -1,0 +1,794 @@
+import { useState, useEffect, useRef, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously } from 'firebase/auth';
+import { getFirestore, collection, addDoc, onSnapshot, doc, updateDoc, deleteDoc } from 'firebase/firestore';
+import Chart from 'chart.js/auto';
+
+// WARNING: These variables are for demonstration purposes only.
+// In a production environment, these values should be configured securely.
+// Please replace 'YOUR_...' with your actual Firebase project credentials.
+const __firebase_config = '{"apiKey": "YOUR_API_KEY", "authDomain": "YOUR_AUTH_DOMAIN", "projectId": "YOUR_PROJECT_ID", "storageBucket": "YOUR_STORAGE_BUCKET", "messagingSenderId": "YOUR_MESSAGING_SENDER_ID", "appId": "YOUR_APP_ID"}';
+const __app_id = 'default-app-id';
+const __initial_auth_token = '';
+
+const firebaseConfig = JSON.parse(__firebase_config);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+function App() {
+  const [observations, setObservations] = useState([]);
+  const [observerName, setObserverName] = useState('');
+  const [teacherName, setTeacherName] = useState('');
+  const [date, setDate] = useState('');
+  const [className, setClassName] = useState('');
+  const [ratings, setRatings] = useState({
+    preparation: { score: 0, comment: '' },
+    technique: { score: 0, comment: '' },
+    studentEngagement: { score: 0, comment: '' },
+    teachingActivities: { score: 0, comment: '' },
+    curriculumAndPolicy: { score: 0, comment: '' },
+    overall: { score: 0, comment: '' }
+  });
+  const [isEditing, setIsEditing] = useState(false);
+  const [currentObservationId, setCurrentObservationId] = useState(null);
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [showModal, setShowModal] = useState(false);
+  const [modalMessage, setModalMessage] = useState('');
+  const [darkMode, setDarkMode] = useState(true);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedTeacher, setSelectedTeacher] = useState('');
+  
+  const radarChartRef = useRef(null);
+  const radarChartInstanceRef = useRef(null);
+  const trendChartRef = useRef(null);
+  const trendChartInstanceRef = useRef(null);
+
+  const showCustomModal = (message) => {
+    setModalMessage(message);
+    setShowModal(true);
+  };
+
+  const hideCustomModal = () => {
+    setShowModal(false);
+    setModalMessage('');
+  };
+
+  const calculateOverallRating = (currentRatings) => {
+    const topicKeys = ['preparation', 'technique', 'studentEngagement', 'teachingActivities', 'curriculumAndPolicy'];
+    const totalScore = topicKeys
+      .map(key => currentRatings[key].score)
+      .reduce((sum, score) => sum + score, 0);
+    return totalScore;
+  };
+  
+  const getOverallRatingText = (totalScore) => {
+    if (totalScore >= 21) {
+      return "Excellent";
+    } else if (totalScore >= 16) {
+      return "Proficient";
+    } else if (totalScore >= 11) {
+      return "Developing";
+    } else if (totalScore >= 5) {
+      return "Needs Improvement";
+    } else {
+      return "No Rating";
+    }
+  };
+
+  const getRatingColorClass = (totalScore) => {
+    if (totalScore >= 21) {
+      return "text-green-500";
+    } else if (totalScore >= 16) {
+      return "text-blue-500";
+    } else if (totalScore >= 11) {
+      return "text-yellow-500";
+    } else if (totalScore >= 5) {
+      return "text-red-500";
+    } else {
+      return "text-gray-500";
+    }
+  };
+
+  const getRatingHexColor = (totalScore) => {
+    if (totalScore >= 21) {
+      return "#22C55E";
+    } else if (totalScore >= 16) {
+      return "#3B82F6";
+    } else if (totalScore >= 11) {
+      return "#EAB308";
+    } else if (totalScore >= 5) {
+      return "#EF4444";
+    } else {
+      return "#6B7280";
+    }
+  };
+
+  // Update overall rating whenever sub-ratings change
+  useEffect(() => {
+    const overallScore = calculateOverallRating(ratings);
+    setRatings(prevRatings => ({
+      ...prevRatings,
+      overall: {
+        ...prevRatings.overall,
+        score: overallScore
+      }
+    }));
+  }, [
+    ratings.preparation.score,
+    ratings.technique.score,
+    ratings.studentEngagement.score,
+    ratings.teachingActivities.score,
+    ratings.curriculumAndPolicy.score
+  ]);
+
+  // Initialize Firebase and Auth
+  useEffect(() => {
+    if (!firebaseConfig || !firebaseConfig.projectId) {
+      console.error("Firebase config is invalid. Skipping initialization.");
+      showCustomModal("Firebase initialization error: Missing project ID. Please check the settings.");
+      return;
+    }
+    
+    try {
+      const app = initializeApp(firebaseConfig);
+      const firestore = getFirestore(app);
+      const firebaseAuth = getAuth(app);
+      setDb(firestore);
+      setAuth(firebaseAuth);
+
+      const signIn = async () => {
+        try {
+          if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+            await signInWithCustomToken(firebaseAuth, __initial_auth_token);
+          } else {
+            await signInAnonymously(firebaseAuth);
+          }
+          const currentUser = firebaseAuth.currentUser;
+          if (currentUser) {
+            setUserId(currentUser.uid);
+            console.log("Firebase signed in successfully. User ID:", currentUser.uid);
+          } else {
+            console.error("Firebase sign-in failed. No user found.");
+            showCustomModal("Sign-in failed: No user found.");
+          }
+        } catch (error) {
+          console.error("Firebase Auth error:", error);
+          showCustomModal(`Sign-in error: ${error.message}`);
+        }
+      };
+      signIn();
+    } catch (error) {
+      console.error("Firebase initialization error:", error);
+      showCustomModal(`Firebase initialization error: ${error.message}`);
+    }
+  }, []);
+
+  // Fetch observations in real-time
+  useEffect(() => {
+    if (db && userId) {
+      const observationsCollectionPath = `/artifacts/${appId}/users/${userId}/teacher_observations`;
+      const q = collection(db, observationsCollectionPath);
+      
+      const unsubscribe = onSnapshot(q, (querySnapshot) => {
+        const obs = [];
+        querySnapshot.forEach((doc) => {
+          obs.push({ id: doc.id, ...doc.data() });
+        });
+        setObservations(obs.sort((a, b) => new Date(b.date) - new Date(a.date)));
+      }, (error) => {
+        console.error("Failed to fetch observations:", error);
+        showCustomModal("Failed to fetch observations. Please try again.");
+      });
+
+      return () => unsubscribe();
+    }
+  }, [db, userId]);
+
+  // Radar Chart for the current observation form
+  useEffect(() => {
+    if (radarChartRef.current) {
+      if (radarChartInstanceRef.current) {
+        radarChartInstanceRef.current.destroy();
+      }
+
+      const labels = ['Preparation', 'Technique', 'Student Engagement', 'Teaching Activities', 'Curriculum & Policy'];
+      const scores = labels.map(label => {
+        if (label === 'Preparation') return ratings.preparation.score;
+        if (label === 'Technique') return ratings.technique.score;
+        if (label === 'Student Engagement') return ratings.studentEngagement.score;
+        if (label === 'Teaching Activities') return ratings.teachingActivities.score;
+        if (label === 'Curriculum & Policy') return ratings.curriculumAndPolicy.score;
+        return 0;
+      });
+
+      const textColor = darkMode ? 'white' : 'black';
+      const gridColor = darkMode ? 'rgba(255, 255, 255, 0.3)' : 'rgba(0, 0, 0, 0.3)';
+
+      radarChartInstanceRef.current = new Chart(radarChartRef.current, {
+        type: 'radar',
+        data: {
+          labels: labels,
+          datasets: [{
+            label: 'Observation Score',
+            data: scores,
+            backgroundColor: darkMode ? 'rgba(79, 70, 229, 0.2)' : 'rgba(79, 70, 229, 0.5)',
+            borderColor: darkMode ? 'rgba(79, 70, 229, 1)' : 'rgba(79, 70, 229, 0.8)',
+            pointBackgroundColor: darkMode ? 'rgba(79, 70, 229, 1)' : 'rgba(79, 70, 229, 0.8)',
+            pointBorderColor: '#fff',
+            pointHoverBackgroundColor: '#fff',
+            pointHoverBorderColor: darkMode ? 'rgba(79, 70, 229, 1)' : 'rgba(79, 70, 229, 0.8)'
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            r: {
+              angleLines: {
+                color: gridColor
+              },
+              suggestedMin: 0,
+              suggestedMax: 5,
+              ticks: {
+                stepSize: 1,
+                color: textColor,
+                backdropColor: darkMode ? '#1e293b' : '#f1f5f9'
+              },
+              grid: {
+                color: gridColor
+              },
+              pointLabels: {
+                color: textColor
+              }
+            }
+          },
+          plugins: {
+            legend: {
+              position: 'top',
+              labels: {
+                color: textColor
+              }
+            },
+            title: {
+              display: true,
+              text: 'Observation Score Overview',
+              color: textColor
+            }
+          }
+        }
+      });
+    }
+
+    return () => {
+      if (radarChartInstanceRef.current) {
+        radarChartInstanceRef.current.destroy();
+      }
+    };
+  }, [ratings, darkMode]);
+
+  // Trend Analysis Chart for selected teacher
+  useEffect(() => {
+    if (trendChartRef.current && selectedTeacher) {
+      if (trendChartInstanceRef.current) {
+        trendChartInstanceRef.current.destroy();
+      }
+      
+      const filteredObservations = observations
+        .filter(obs => obs.teacherName === selectedTeacher)
+        .sort((a, b) => new Date(a.date) - new Date(a.date));
+
+      const labels = filteredObservations.map(obs => obs.date);
+      const scores = filteredObservations.map(obs => obs.ratings.overall.score);
+
+      const textColor = darkMode ? 'white' : 'black';
+      const gridColor = darkMode ? 'rgba(255, 255, 255, 0.3)' : 'rgba(0, 0, 0, 0.3)';
+
+      trendChartInstanceRef.current = new Chart(trendChartRef.current, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [{
+            label: `${selectedTeacher}'s Overall Score Trend`,
+            data: scores,
+            fill: false,
+            borderColor: getRatingHexColor(scores[scores.length - 1]),
+            tension: 0.1
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            y: {
+              beginAtZero: true,
+              suggestedMax: 25,
+              grid: {
+                color: gridColor
+              },
+              ticks: {
+                color: textColor
+              }
+            },
+            x: {
+              grid: {
+                color: gridColor
+              },
+              ticks: {
+                color: textColor
+              }
+            }
+          },
+          plugins: {
+            legend: {
+              labels: {
+                color: textColor
+              }
+            },
+            title: {
+              display: true,
+              text: `Overall Score Trend for ${selectedTeacher}`,
+              color: textColor
+            }
+          }
+        }
+      });
+    } else if (trendChartInstanceRef.current) {
+      trendChartInstanceRef.current.destroy();
+    }
+
+    return () => {
+      if (trendChartInstanceRef.current) {
+        trendChartInstanceRef.current.destroy();
+      }
+    };
+  }, [selectedTeacher, observations, darkMode]);
+
+  // Memoize unique teacher names for the dropdown
+  const uniqueTeachers = useMemo(() => {
+    const teachers = new Set(observations.map(obs => obs.teacherName));
+    return Array.from(teachers);
+  }, [observations]);
+
+  // Filter observations based on search query
+  const filteredObservations = observations.filter(obs =>
+    obs.teacherName.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+
+  const handleRatingChange = (topic, field, value) => {
+    setRatings(prevRatings => ({
+      ...prevRatings,
+      [topic]: {
+        ...prevRatings[topic],
+        [field]: field === 'score' ? (value >= 1 && value <= 5 ? parseInt(value) : 0) : value
+      }
+    }));
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!observerName || !teacherName || !date || !className) {
+      showCustomModal("Please fill in all required fields.");
+      return;
+    }
+
+    const allScoresValid = [
+      ratings.preparation.score,
+      ratings.technique.score,
+      ratings.studentEngagement.score,
+      ratings.teachingActivities.score,
+      ratings.curriculumAndPolicy.score,
+    ].every(score => score >= 1 && score <= 5);
+
+    if (!allScoresValid) {
+      showCustomModal("Please rate each topic between 1 and 5.");
+      return;
+    }
+
+    if (!db || !userId) {
+      showCustomModal("Cannot connect to the database. Please try again.");
+      return;
+    }
+    
+    // Recalculate overall score one last time before saving
+    const finalOverallScore = calculateOverallRating(ratings);
+    const finalRatings = {
+      ...ratings,
+      overall: {
+        ...ratings.overall,
+        score: finalOverallScore
+      }
+    };
+
+    const observationsCollectionPath = `/artifacts/${appId}/users/${userId}/teacher_observations`;
+    const newObservation = { observerName, teacherName, date, className, ratings: finalRatings, createdAt: new Date() };
+
+    if (isEditing) {
+      try {
+        const docRef = doc(db, observationsCollectionPath, currentObservationId);
+        await updateDoc(docRef, newObservation);
+        showCustomModal("Observation record updated successfully.");
+      } catch (error) {
+        console.error("Error updating document:", error);
+        showCustomModal(`Error updating record: ${error.message}`);
+      }
+    } else {
+      try {
+        await addDoc(collection(db, observationsCollectionPath), newObservation);
+        showCustomModal("Observation record added successfully.");
+      } catch (error) {
+        console.error("Error adding document:", error);
+        showCustomModal(`Error saving record: ${error.message}`);
+      }
+    }
+
+    setObserverName('');
+    setTeacherName('');
+    setDate('');
+    setClassName('');
+    setRatings({
+      preparation: { score: 0, comment: '' },
+      technique: { score: 0, comment: '' },
+      studentEngagement: { score: 0, comment: '' },
+      teachingActivities: { score: 0, comment: '' },
+      curriculumAndPolicy: { score: 0, comment: '' },
+      overall: { score: 0, comment: '' }
+    });
+    setIsEditing(false);
+    setCurrentObservationId(null);
+  };
+
+  const handleEdit = (observation) => {
+    setObserverName(observation.observerName);
+    setTeacherName(observation.teacherName);
+    setDate(observation.date);
+    setClassName(observation.className);
+    setRatings(observation.ratings);
+    setIsEditing(true);
+    setCurrentObservationId(observation.id);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleDelete = async (id) => {
+    if (!db || !userId) {
+      showCustomModal("Cannot connect to the database. Please try again.");
+      return;
+    }
+    const observationsCollectionPath = `/artifacts/${appId}/users/${userId}/teacher_observations`;
+    try {
+      await deleteDoc(doc(db, observationsCollectionPath, id));
+      showCustomModal("Observation record deleted successfully.");
+    } catch (error) {
+      console.error("Error deleting document:", error);
+      showCustomModal(`Error deleting record: ${error.message}`);
+    }
+  };
+
+  const handlePrint = () => {
+    window.print();
+  };
+
+  return (
+    <div className={`${darkMode ? 'bg-slate-900 text-gray-200' : 'bg-gray-100 text-gray-800'} min-h-screen p-4 sm:p-8 font-sans transition-colors duration-500`}>
+      <div className={`${darkMode ? 'bg-slate-800' : 'bg-white'} max-w-4xl mx-auto rounded-xl shadow-lg p-6 sm:p-10`}>
+        <div className="flex justify-end no-print mb-4">
+          <button
+            onClick={() => setDarkMode(!darkMode)}
+            className={`${darkMode ? 'text-gray-400 hover:text-white' : 'text-gray-600 hover:text-gray-900'} transition-colors duration-500`}
+            title={darkMode ? "Switch to Light Mode" : "Switch to Dark Mode"}
+          >
+            {darkMode ? (
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" viewBox="0 0 20 20" fill="currentColor">
+                <path d="M17.293 13.293A8 8 0 016.707 2.707a8.001 8.001 0 1010.586 10.586z" />
+              </svg>
+            ) : (
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" viewBox="0 0 20 20" fill="currentColor">
+                <path d="M10 2a1 1 0 011 1v1a1 1 0 11-2 0V3a1 1 0 011-1zm4 10a4 4 0 11-8 0 4 4 0 018 0zm-.947-7.747a.5.5 0 01-.137.527l-.398.397a.5.5 0 01-.707 0L10 4.707l-1.815-1.815a.5.5 0 01.707-.707L10 4.293l1.815-1.815a.5.5 0 01.707 0l.397.398a.5.5 0 01.137.527zM2 10a1 1 0 011-1h1a1 1 0 110 2H3a1 1 0 01-1-1zm15 0a1 1 0 011-1h1a1 1 0 110 2h-1a1 1 0 01-1-1zm-9.747 5.947a.5.5 0 01.527.137l.397.398a.5.5 0 010 .707L10 15.293l1.815 1.815a.5.5 0 01-.707.707L10 15.707l-1.815 1.815a.5.5 0 01-.707 0l-.398-.397a.5.5 0 01-.137-.527zM10 17a1 1 0 011 1v1a1 1 0 11-2 0v-1a1 1 0 011-1zM5 10a1 1 0 011-1h1a1 1 0 110 2H6a1 1 0 01-1-1z" clipRule="evenodd" />
+              </svg>
+            )}
+          </button>
+        </div>
+        <div className="no-print">
+          <h1 className="text-3xl sm:text-4xl font-bold mb-6 text-center">
+            Teacher Observation WebApp
+          </h1>
+          {/* Search and Trend Controls - Moved to the top */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-8">
+              <div className="space-y-4">
+                  <label htmlFor="teacher-select" className="block text-sm font-medium">Select a Teacher to view trend</label>
+                  <select
+                    id="teacher-select"
+                    value={selectedTeacher}
+                    onChange={(e) => setSelectedTeacher(e.target.value)}
+                    className={`${darkMode ? 'bg-slate-700 border-gray-600 text-white' : 'bg-gray-200 border-gray-300 text-gray-800'} mt-1 block w-full rounded-md shadow-sm p-2 border`}
+                  >
+                      <option value="">-- Select a teacher --</option>
+                      {uniqueTeachers.map(name => (
+                          <option key={name} value={name}>{name}</option>
+                      ))}
+                  </select>
+              </div>
+              <div className="space-y-4">
+                  <label htmlFor="search-records" className="block text-sm font-medium">Search Records</label>
+                  <input
+                    type="text"
+                    id="search-records"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className={`${darkMode ? 'bg-slate-700 border-gray-600 text-white' : 'bg-gray-200 border-gray-300 text-gray-800'} mt-1 block w-full rounded-md shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border`}
+                    placeholder="Search by teacher's name"
+                  />
+              </div>
+          </div>
+          <form onSubmit={handleSubmit} className="space-y-6">
+            {/* Observer's and Teacher's Name - side-by-side */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label htmlFor="observerName" className="block text-sm font-medium">Observer's Name</label>
+                <input
+                  type="text"
+                  id="observerName"
+                  value={observerName}
+                  onChange={(e) => setObserverName(e.target.value)}
+                  className={`${darkMode ? 'bg-slate-700 border-gray-600 text-white' : 'bg-gray-200 border-gray-300 text-gray-800'} mt-1 block w-full rounded-md shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border`}
+                  placeholder="Observer's Name"
+                />
+              </div>
+              <div>
+                <label htmlFor="teacherName" className="block text-sm font-medium">Teacher's Name</label>
+                <input
+                  type="text"
+                  id="teacherName"
+                  value={teacherName}
+                  onChange={(e) => setTeacherName(e.target.value)}
+                  className={`${darkMode ? 'bg-slate-700 border-gray-600 text-white' : 'bg-gray-200 border-gray-300 text-gray-800'} mt-1 block w-full rounded-md shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border`}
+                  placeholder="Teacher's Name"
+                />
+              </div>
+            </div>
+            
+            {/* The rest of the fields */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label htmlFor="date" className="block text-sm font-medium">Observation Date</label>
+                <input
+                  type="date"
+                  id="date"
+                  value={date}
+                  onChange={(e) => setDate(e.target.value)}
+                  className={`${darkMode ? 'bg-slate-700 border-gray-600 text-white' : 'bg-gray-200 border-gray-300 text-gray-800'} mt-1 block w-full rounded-md shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border`}
+                />
+              </div>
+              <div>
+                <label htmlFor="className" className="block text-sm font-medium">Class / Subject</label>
+                <input
+                  type="text"
+                  id="className"
+                  value={className}
+                  onChange={(e) => setClassName(e.target.value)}
+                  className={`${darkMode ? 'bg-slate-700 border-gray-600 text-white' : 'bg-gray-200 border-gray-300 text-gray-800'} mt-1 block w-full rounded-md shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border`}
+                  placeholder="e.g. Math G5, Science G8"
+                />
+              </div>
+            </div>
+            
+            <div className="space-y-4">
+              <h3 className="text-md font-bold">Rate Teaching (1-5) and provide comments</h3>
+              {Object.keys(ratings).filter(key => key !== 'overall').map((topicKey) => (
+                <div key={topicKey} className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+                  <div className="sm:col-span-1">
+                    <label htmlFor={`${topicKey}-score`} className="block text-sm font-medium">
+                      {topicKey === 'preparation' && 'Preparation'}
+                      {topicKey === 'technique' && 'Technique'}
+                      {topicKey === 'studentEngagement' && 'Student Engagement'}
+                      {topicKey === 'teachingActivities' && 'Teaching Activities'}
+                      {topicKey === 'curriculumAndPolicy' && 'Curriculum & Policy'}
+                    </label>
+                    <input
+                      type="number"
+                      id={`${topicKey}-score`}
+                      value={ratings[topicKey].score}
+                      onChange={(e) => handleRatingChange(topicKey, 'score', e.target.value)}
+                      className={`${darkMode ? 'bg-slate-700 border-gray-600 text-white' : 'bg-gray-200 border-gray-300 text-gray-800'} mt-1 block w-full rounded-md shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border`}
+                      min="1"
+                      max="5"
+                    />
+                  </div>
+                  <div className="sm:col-span-3">
+                    <label htmlFor={`${topicKey}-comment`} className="block text-sm font-medium">Comment</label>
+                    <textarea
+                      id={`${topicKey}-comment`}
+                      value={ratings[topicKey].comment}
+                      onChange={(e) => handleRatingChange(topicKey, 'comment', e.target.value)}
+                      rows="2"
+                      className={`${darkMode ? 'bg-slate-700 border-gray-600 text-white' : 'bg-gray-200 border-gray-300 text-gray-800'} mt-1 block w-full rounded-md shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border`}
+                      placeholder="Add a comment"
+                    ></textarea>
+                  </div>
+                </div>
+              ))}
+              <div className={`${darkMode ? 'bg-slate-700' : 'bg-gray-200'} rounded-md p-4 mt-4`}>
+                <label htmlFor="overall-score" className="block text-sm font-bold">
+                  Overall Score
+                </label>
+                <input
+                  type="text"
+                  id="overall-score"
+                  value={ratings.overall.score}
+                  className={`${darkMode ? 'bg-slate-600 border-gray-600 text-white' : 'bg-gray-300 border-gray-300 text-gray-800'} mt-1 block w-20 rounded-md shadow-sm p-2 border`}
+                  readOnly
+                />
+                <p className="text-sm font-bold mt-2">
+                  Overall Rating: <span className={`font-normal ${getRatingColorClass(ratings.overall.score)}`}>{getOverallRatingText(ratings.overall.score)}</span>
+                </p>
+                <div className="w-full h-2 rounded-full mt-2 overflow-hidden">
+                    <div
+                        className={`h-full ${getRatingColorClass(ratings.overall.score).replace('text-', 'bg-')}`}
+                        style={{ width: `${(ratings.overall.score / 25) * 100}%` }}
+                    ></div>
+                </div>
+                <label htmlFor="overall-comment" className="block text-sm font-medium mt-2">Overall Comment</label>
+                <textarea
+                  id="overall-comment"
+                  value={ratings.overall.comment}
+                  onChange={(e) => handleRatingChange('overall', 'comment', e.target.value)}
+                  rows="4"
+                  className={`${darkMode ? 'bg-slate-700 border-gray-600 text-white' : 'bg-gray-200 border-gray-300 text-gray-800'} mt-1 block w-full rounded-md shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border`}
+                  placeholder="Add an overall comment"
+                ></textarea>
+              </div>
+            </div>
+            
+            <button
+              type="submit"
+              className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-lg font-medium text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors"
+            >
+              {isEditing ? 'Update Record' : 'Save Observation'}
+            </button>
+            {isEditing && (
+              <button
+                type="button"
+                onClick={() => {
+                  setIsEditing(false);
+                  setCurrentObservationId(null);
+                  setObserverName('');
+                  setTeacherName('');
+                  setDate('');
+                  setClassName('');
+                  setRatings({
+                    preparation: { score: 0, comment: '' },
+                    technique: { score: 0, comment: '' },
+                    studentEngagement: { score: 0, comment: '' },
+                    teachingActivities: { score: 0, comment: '' },
+                    curriculumAndPolicy: { score: 0, comment: '' },
+                    overall: { score: 0, comment: '' }
+                  });
+                }}
+                className="w-full mt-2 flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-lg font-medium text-white bg-slate-700 hover:bg-slate-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-slate-500 transition-colors"
+              >
+                Cancel
+              </button>
+            )}
+          </form>
+
+          <h2 className="text-2xl font-bold mt-12 mb-4 text-center">Observation Overview</h2>
+          <div className="w-full h-[32rem]">
+            <canvas ref={radarChartRef}></canvas>
+          </div>
+
+          <h2 className="text-2xl font-bold mt-12 mb-4 text-center">Teacher Performance Trend</h2>
+          <div className="w-full h-[32rem] mt-6">
+              <canvas ref={trendChartRef}></canvas>
+          </div>
+          <button
+            onClick={handlePrint}
+            className="no-print w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-lg font-medium text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500 transition-colors my-4"
+          >
+            Print Records
+          </button>
+        </div>
+
+        <h2 className="text-2xl font-bold mt-12 mb-4 text-center">All Records</h2>
+        
+        <div className="space-y-6">
+          {filteredObservations.length === 0 ? (
+            <p className="text-center">No observation records found.</p>
+          ) : (
+            filteredObservations.map((obs) => (
+              <div key={obs.id} className={`${darkMode ? 'bg-slate-700 border-slate-600' : 'bg-gray-200 border-gray-300'} border rounded-lg shadow-sm p-6 space-y-3`}>
+                <div className="flex justify-between items-start no-print-buttons">
+                  <div>
+                    <h3 className="text-xl font-semibold">Teacher: {obs.teacherName}</h3>
+                    <p className="text-sm mt-1">
+                      <span className="font-medium">Observer:</span> {obs.observerName}
+                    </p>
+                    <p className="text-sm">
+                      <span className="font-medium">Class/Subject:</span> {obs.className}
+                    </p>
+                    <p className="text-sm">
+                      <span className="font-medium">Date:</span> {obs.date}
+                    </p>
+                  </div>
+                  <div className="flex space-x-2 no-print-buttons">
+                    <button
+                      onClick={() => handleEdit(obs)}
+                      className="text-indigo-400 hover:text-indigo-300 transition-colors"
+                      title="Edit"
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                        <path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zm-3.793 4.414a1 1 0 010 1.414l-4 4a1 1 0 01-.707.293H7.098a1 1 0 01-.707-.293l-4-4a1 1 0 011.414-1.414l.707.707 1.293-1.293-2.586-2.586a1 1 0 011.414-1.414l2.586 2.586 1.293-1.293.707-.707a1 1 0 011.414 0z" />
+                        <path fillRule="evenodd" d="M12.914 7.086l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414l4-4a1 1 0 011.414 0l4 4a1 1 0 010 1.414z" clipRule="evenodd" />
+                      </svg>
+                    </button>
+                    <button
+                      onClick={() => handleDelete(obs.id)}
+                      className="text-red-400 hover:text-red-300 transition-colors"
+                      title="Delete"
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                        <path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" />
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+                <p className="text-sm font-semibold">Scores:</p>
+                <ul className="list-disc list-inside text-sm">
+                  <li className="mb-2">
+                    <span className="font-bold">Preparation:</span> {obs.ratings.preparation.score} / 5<br/>
+                    <span className="text-xs italic">Comment: {obs.ratings.preparation.comment || '-'}</span>
+                  </li>
+                  <li className="mb-2">
+                    <span className="font-bold">Technique:</span> {obs.ratings.technique.score} / 5<br/>
+                    <span className="text-xs italic">Comment: {obs.ratings.technique.comment || '-'}</span>
+                  </li>
+                  <li className="mb-2">
+                    <span className="font-bold">Student Engagement:</span> {obs.ratings.studentEngagement.score} / 5<br/>
+                    <span className="text-xs italic">Comment: {obs.ratings.studentEngagement.comment || '-'}</span>
+                  </li>
+                  <li className="mb-2">
+                    <span className="font-bold">Teaching Activities:</span> {obs.ratings.teachingActivities.score} / 5<br/>
+                    <span className="text-xs italic">Comment: {obs.ratings.teachingActivities.comment || '-'}</span>
+                  </li>
+                  <li className="mb-2">
+                    <span className="font-bold">Curriculum & Policy:</span> {obs.ratings.curriculumAndPolicy.score} / 5<br/>
+                    <span className="text-xs italic">Comment: {obs.ratings.curriculumAndPolicy.comment || '-'}</span>
+                  </li>
+                  <li className="mb-2">
+                    <span className="font-bold">Overall Score:</span> {obs.ratings.overall.score} / 25<br/>
+                    <span className={`font-bold ${getRatingColorClass(obs.ratings.overall.score)}`}>Overall Rating:</span> {getOverallRatingText(obs.ratings.overall.score)}<br/>
+                    <div className="w-full h-2 rounded-full mt-2 overflow-hidden">
+                        <div
+                            className={`h-full ${getRatingColorClass(obs.ratings.overall.score).replace('text-', 'bg-')}`}
+                            style={{ width: `${(obs.ratings.overall.score / 25) * 100}%` }}
+                        ></div>
+                    </div>
+                    <span className="text-xs italic">Overall Comment: {obs.ratings.overall.comment || '-'}</span>
+                  </li>
+                </ul>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+      {/* Custom Modal */}
+      {showModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-gray-600 bg-opacity-50">
+          <div className={`${darkMode ? 'bg-slate-800' : 'bg-white'} rounded-lg shadow-xl p-6 w-11/12 max-w-sm`}>
+            <h3 className="text-xl font-bold mb-4">Notification</h3>
+            <p>{modalMessage}</p>
+            <div className="flex justify-end mt-4">
+              <button
+                onClick={hideCustomModal}
+                className="bg-indigo-600 text-white rounded-md px-4 py-2 hover:bg-indigo-700 transition-colors"
+              >
+                OK
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
